@@ -299,23 +299,93 @@ tf.add_to_collection('losses', nameop(loss_cycle, 'loss_cycle'))
 ####################
 # CORRESPONDENCE LOSS
 
-n_eigenvectors = 1
-loss_correspondence = []
-_, eigv1 = tf.linalg.eigh(kernel(compute_pairwise_distances(tfx1)))
-_, eigv2 = tf.linalg.eigh(kernel(compute_pairwise_distances(tfx2)))
-for i_eig in range(n_eigenvectors):
-    e1 = eigv1[:, i_eig]
-    e2 = eigv2[:, i_eig]
+def diffusion_eigenvector_loss(x1, x2, x1_mappedto_x2, x2_mappedto_x1, n_eigenvectors=1):
+    def compute_pairwise_distances(A):
+        r = tf.reduce_sum(A*A, 1)
 
-    tfx1_e = tf.matmul(tf.transpose(tfx1), e1[:, np.newaxis])
-    tfg2_e = tf.matmul(tf.transpose(fake2), e1[:, np.newaxis])
+        r = tf.reshape(r, [-1, 1])
+        D = r - 2*tf.matmul(A, tf.transpose(A)) + tf.transpose(r)
 
-    tfg1_e = tf.matmul(tf.transpose(fake1), e2[:, np.newaxis])
-    tfx2_e = tf.matmul(tf.transpose(tfx2), e2[:, np.newaxis])
+        return D
 
-    loss_correspondence.append(tf.reduce_mean((tfx1_e - tfg2_e)**2))
-    loss_correspondence.append(tf.reduce_mean((tfx2_e - tfg1_e)**2))
-loss_correspondence = tf.reduce_mean(loss_correspondence)
+    def dist(a, b):
+
+        return tf.reduce_mean((a - b)**2)
+
+    def kernel(dists, sigmas=None, power=10):
+        dists = 1 - dists / tf.sort(dists, axis=1)[:, tf.shape(dists)[0] // 10][:, np.newaxis]
+        dists = tf.maximum(dists, tf.zeros_like(dists))
+        dists = dists / tf.reduce_sum(dists, axis=1, keep_dims=True)
+        for _ in range(power):
+            dists = tf.matmul(dists, dists)
+            dists = dists / tf.reduce_sum(dists, axis=1, keep_dims=True)
+        return dists
+
+    def rescale(data):
+        newdata = []
+        for i in range(n_eigenvectors):
+            col = data[:, i]
+            col = col - tf.reduce_min(col)
+            col = col / tf.reduce_max(col)
+            col = 2 * col - 1
+            newdata.append(col)
+        newdata = tf.stack(newdata, axis=-1)
+        return newdata
+
+    def check_for_anticorrelation(data1, data2, thresh=-.5):
+        modifier = []
+        for i in range(n_eigenvectors):
+            col1 = data1[:, i][:, np.newaxis]
+            col2 = data2[:, i][:, np.newaxis]
+            r = tfp.stats.correlation(col1, col2)[0, 0]
+            modifier.append(tf.cond(r < thresh, lambda: tf.constant(-1.), lambda: tf.constant(1.)))
+        modifier = tf.stack(modifier)
+        return modifier
+
+    loss = []
+    x1_k = kernel(compute_pairwise_distances(x1))
+    x2_k = kernel(compute_pairwise_distances(x2))
+    eigv_x1 = rescale(tf.linalg.eigh(x1_k)[1][:, :n_eigenvectors])
+    eigv_x2 = rescale(tf.linalg.eigh(x2_k)[1][:, :n_eigenvectors])
+
+    x1_mappedto_x2_k = kernel(compute_pairwise_distances(x1_mappedto_x2))
+    x2_mappedto_x1_k = kernel(compute_pairwise_distances(x2_mappedto_x1))
+    eigv_g12 = rescale(tf.linalg.eigh(x1_mappedto_x2_k)[1][:, :n_eigenvectors])
+    eigv_g21 = rescale(tf.linalg.eigh(x2_mappedto_x1_k)[1][:, :n_eigenvectors])
+
+    eigv_x1 = nameop(eigv_x1, 'eigv_x1')
+    eigv_g12 = nameop(eigv_g12, 'eigv_g12')
+
+    eigv_g12 = check_for_anticorrelation(eigv_x1, eigv_g12) * eigv_g12
+    eigv_g21 = check_for_anticorrelation(eigv_x1, eigv_g21) * eigv_g21
+    loss.append(dist(eigv_x1, eigv_g12))
+    loss.append(dist(eigv_x2, eigv_g21))
+
+    for bin_size in [2, 4]:
+        newvec_x1 = []
+        newvec_x2 = []
+        newvec_g12 = []
+        newvec_g21 = []
+        for bin in np.array_split(range(n_eigenvectors), n_eigenvectors // bin_size):
+            newvec_x1.append(tf.reduce_sum(tf.gather(eigv_x1, bin, axis=-1), axis=-1))
+            newvec_x2.append(tf.reduce_sum(tf.gather(eigv_x2, bin, axis=-1), axis=-1))
+            newvec_g12.append(tf.reduce_sum(tf.gather(eigv_g12, bin, axis=-1), axis=-1))
+            newvec_g21.append(tf.reduce_sum(tf.gather(eigv_g21, bin, axis=-1), axis=-1))
+        newvec_x1 = tf.stack(newvec_x1, axis=-1)
+        newvec_x2 = tf.stack(newvec_x2, axis=-1)
+        newvec_g12 = tf.stack(newvec_g12, axis=-1)
+        newvec_g21 = tf.stack(newvec_g21, axis=-1)
+
+        loss.append((1. / bin_size) * dist(newvec_x1, newvec_g12))
+        loss.append((1. / bin_size) * dist(newvec_x2, newvec_g21))
+
+    loss = tf.reduce_mean(loss)
+
+    return loss
+
+
+loss_correspondence = diffusion_eigenvector_loss(tfx1, tfx2, fake2, fake1, n_eigenvectors=12)
+
 
 loss_G += lambda_correspondence * loss_correspondence
 tf.add_to_collection('losses', nameop(loss_correspondence, 'loss_correspondence'))
