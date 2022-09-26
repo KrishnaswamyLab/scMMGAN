@@ -2,6 +2,7 @@ import numpy as np
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
 import time
+import tensorflow_probability as tfp
 ##########
 
 ############################################################
